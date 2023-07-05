@@ -1,70 +1,50 @@
+mod commands;
+
 use anyhow::anyhow;
-use serenity::async_trait;
-use serenity::model::channel::Message;
-use serenity::model::gateway::Ready;
-use serenity::model::id::GuildId;
-use serenity::model::application::interaction::Interaction;
-use serenity::model::application::interaction::InteractionResponseType;
-use serenity::prelude::*;
+use poise::serenity_prelude as serenity;
 use shuttle_secrets::SecretStore;
-use tracing::{error, info};
 
-struct Bot;
+use std::{collections::HashMap, sync::Mutex};
 
-#[async_trait]
-impl EventHandler for Bot {
-    async fn message(&self, ctx: Context, msg: Message) {
-        if msg.content == "!hello" {
-            if let Err(e) = msg.channel_id.say(&ctx.http, "world!").await {
-                error!("Error sending message: {:?}", e);
-            }
-        }
-    }
-
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("{} is connected!", ready.user.name);
-
-        let guild_id = GuildId(338858345085534210);
-
-        GuildId::set_application_commands(&guild_id, &ctx.http, |commands| {
-            commands.create_application_command(|command| { command.name("hello").description("Say hello") })
-        }).await.unwrap();
-    }
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
-            let response_content = 
-                match command.data.name.as_str() {
-                    "hello" => "world!".to_owned(),
-                    command => unreachable!("Unknown command: {}", command),
-                };
-            command.create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| message.content(response_content))
-                }).await.expect("Cannot respond to slash command");
-        }
-    }
+pub struct Data {
+    votes: Mutex<HashMap<String, u32>>,
 }
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Context<'a> = poise::Context<'a, Data, Error>;
+
 
 #[shuttle_runtime::main]
-async fn serenity(
+async fn poise(
     #[shuttle_secrets::Secrets] secret_store: SecretStore,
-) -> shuttle_serenity::ShuttleSerenity {
-    // Get the discord token set in `Secrets.toml`
+) -> shuttle_poise::ShuttlePoise<Data, Error> {
     let token = if let Some(token) = secret_store.get("DISCORD_TOKEN") {
         token
     } else {
-        return Err(anyhow!("'DISCORD_TOKEN' was not found").into());
+        return Err(anyhow!("DISCORD_TOKEN was not found").into());
     };
 
-    // Set gateway intents, which decides what events the bot will be notified about
-    let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
-
-    let client = Client::builder(&token, intents)
-        .event_handler(Bot)
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: vec![
+                commands::age(),
+                commands::help(),
+                commands::vote(),
+                commands::getvotes(),
+            ],
+            ..Default::default()
+        })
+        .token(token)
+        .intents(serenity::GatewayIntents::non_privileged())
+        .setup(|ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(Data { 
+                    votes: Mutex::new(HashMap::new()),
+                })
+            })
+        }).build()
         .await
-        .expect("Err creating client");
+        .map_err(shuttle_runtime::CustomError::new)?;
 
-    Ok(client.into())
+        Ok(framework.into())
 }
